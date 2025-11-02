@@ -542,7 +542,7 @@ class OrderStatusHandler:
             return None
 
         # 退款成功/订单关闭
-        cancelled_keywords = ['退款成功', '退货成功', '退货退款成功', '退款退货成功', '关闭订单', '交易关闭', '退款已完成']
+        cancelled_keywords = ['退款成功', '退货成功', '退货退款成功', '退款退货成功', '关闭订单', '交易关闭', '退款已完成', '交易成功，有退款', '交易成功，已退款']
         if any(keyword in task_name for keyword in cancelled_keywords):
             logger.info(f"🔍 根据taskName推断订单关闭: {task_name}")
             return 'cancelled'
@@ -658,7 +658,7 @@ class OrderStatusHandler:
                     normalized_tip = tip_content.strip().strip('[]【】')
                     logger.info(f"🔍 检查退款Tip消息: '{normalized_tip}'")
 
-                    if any(keyword in normalized_tip for keyword in ['退款成功', '钱款已原路退返', '钱款已退回', '退款已完成', '交易关闭，已退款', '交易成功，已退款']):
+                    if any(keyword in normalized_tip for keyword in ['退款成功', '钱款已原路退返', '钱款已退回', '退款已完成', '交易关闭，已退款', '交易成功，已退款', '交易成功，有退款']):
                         logger.info("✅ 识别到退款成功提示消息")
                         return 'cancelled'
 
@@ -697,7 +697,7 @@ class OrderStatusHandler:
 
                     logger.info(f"🔍 检查退款提示文本: '{normalized_extra}'")
 
-                    if any(keyword in normalized_extra for keyword in ['退款成功', '钱款已原路退返', '钱款已退回', '退款已完成', '交易关闭，已退款', '交易成功，已退款']):
+                    if any(keyword in normalized_extra for keyword in ['退款成功', '钱款已原路退返', '钱款已退回', '退款已完成', '交易关闭，已退款', '交易成功，已退款', '交易成功，有退款']):
                         logger.info("✅ 识别到退款成功提示文本")
                         return 'cancelled'
 
