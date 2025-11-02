@@ -690,6 +690,10 @@ class XianyuLive:
             '[我已付款，等待你发货]',
             '[已付款，待发货]',
             '我已付款，等待你发货',
+            '[买家已付款]',
+            '买家已付款',
+            '[付款完成]',
+            '付款完成',
             '[记得及时发货]',
         ]
 
@@ -3020,8 +3024,8 @@ class XianyuLive:
             if secret:
                 string_to_sign = f'{timestamp}\n{secret}'
                 hmac_code = hmac.new(
+                    secret.encode('utf-8'),
                     string_to_sign.encode('utf-8'),
-                    ''.encode('utf-8'),
                     digestmod=hashlib.sha256
                 ).digest()
                 sign = base64.b64encode(hmac_code).decode('utf-8')
@@ -6146,8 +6150,8 @@ class XianyuLive:
                         self.heartbeat_task = asyncio.create_task(self.heartbeat_loop(websocket))
 
                         # 启动token刷新任务
-                        logger.info(f"【{self.cookie_id}】启动token刷新任务...")
-                        self.token_refresh_task = asyncio.create_task(self.token_refresh_loop())
+                        # logger.info(f"【{self.cookie_id}】启动token刷新任务...")
+                        # self.token_refresh_task = asyncio.create_task(self.token_refresh_loop())
 
                         # 启动暂停记录清理任务
                         if not self.cleanup_task:

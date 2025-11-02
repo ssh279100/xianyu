@@ -7,98 +7,11 @@
 
 import os
 import sys
-import shutil
-from pathlib import Path
-
-# ==================== 在导入任何模块之前先迁移数据库 ====================
-def _migrate_database_files_early():
-    """在启动前检查并迁移数据库文件到data目录（使用print，因为logger还未初始化）"""
-    print("检查数据库文件位置...")
-    
-    # 确保data目录存在
-    data_dir = Path("data")
-    if not data_dir.exists():
-        data_dir.mkdir(parents=True, exist_ok=True)
-        print("✓ 创建 data 目录")
-    
-    # 定义需要迁移的文件
-    files_to_migrate = [
-        ("xianyu_data.db", "data/xianyu_data.db", "主数据库"),
-        ("user_stats.db", "data/user_stats.db", "统计数据库"),
-    ]
-    
-    migrated_files = []
-    
-    # 迁移主数据库和统计数据库
-    for old_path, new_path, description in files_to_migrate:
-        old_file = Path(old_path)
-        new_file = Path(new_path)
-        
-        if old_file.exists():
-            if not new_file.exists():
-                # 新位置不存在，移动文件
-                try:
-                    shutil.move(str(old_file), str(new_file))
-                    print(f"✓ 迁移{description}: {old_path} -> {new_path}")
-                    migrated_files.append(description)
-                except Exception as e:
-                    print(f"⚠ 无法迁移{description}: {e}")
-                    print(f"  尝试复制文件...")
-                    try:
-                        shutil.copy2(str(old_file), str(new_file))
-                        print(f"✓ 已复制{description}到新位置")
-                        print(f"  请在确认数据正常后手动删除: {old_path}")
-                        migrated_files.append(f"{description}(已复制)")
-                    except Exception as e2:
-                        print(f"✗ 复制{description}失败: {e2}")
-            else:
-                # 新位置已存在，检查旧文件大小
-                try:
-                    if old_file.stat().st_size > 0:
-                        print(f"⚠ 发现旧{description}文件: {old_path}")
-                        print(f"  新数据库位于: {new_path}")
-                        print(f"  建议备份后删除旧文件")
-                except:
-                    pass
-    
-    # 迁移备份文件
-    backup_files = list(Path(".").glob("xianyu_data_backup_*.db"))
-    if backup_files:
-        print(f"发现 {len(backup_files)} 个备份文件")
-        backup_migrated = 0
-        for backup_file in backup_files:
-            new_backup_path = data_dir / backup_file.name
-            if not new_backup_path.exists():
-                try:
-                    shutil.move(str(backup_file), str(new_backup_path))
-                    print(f"✓ 迁移备份文件: {backup_file.name}")
-                    backup_migrated += 1
-                except Exception as e:
-                    print(f"⚠ 无法迁移备份文件 {backup_file.name}: {e}")
-        
-        if backup_migrated > 0:
-            migrated_files.append(f"{backup_migrated}个备份文件")
-    
-    # 输出迁移总结
-    if migrated_files:
-        print(f"✓ 数据库迁移完成，已迁移: {', '.join(migrated_files)}")
-    else:
-        print("✓ 数据库文件检查完成")
-    
-    return True
-
-# 在导入 db_manager 之前先执行数据库迁移
-try:
-    _migrate_database_files_early()
-except Exception as e:
-    print(f"⚠ 数据库迁移检查失败: {e}")
-    # 继续启动，因为可能是首次运行
-
-# ==================== 现在可以安全地导入其他模块 ====================
 import asyncio
 import threading
 import uvicorn
 from urllib.parse import urlparse
+from pathlib import Path
 from loguru import logger
 
 # 修复Linux环境下的asyncio子进程问题
@@ -115,6 +28,15 @@ import cookie_manager as cm
 from db_manager import db_manager
 from file_log_collector import setup_file_logging
 from usage_statistics import report_user_count
+
+# 新增：CookieCloud 支持
+# 注意：此文件位于 replace/Start.py，替换后对应 import 为 utils.cookiecloud
+try:
+    from utils.cookiecloud import fetch_cookiecloud_cookie_str
+except Exception:
+    # 在未替换前的运行环境下，避免导入错误导致崩溃
+    fetch_cookiecloud_cookie_str = None
+    logger.warning("utils.cookiecloud 未就绪，CookieCloud 同步将被跳过")
 
 
 def _start_api_server():
@@ -140,25 +62,7 @@ def _start_api_server():
         port = parsed.port or 8080
 
     logger.info(f"启动Web服务器: http://{host}:{port}")
-    # 在后台线程中创建独立事件循环并直接运行 server.serve()
-    import uvicorn
-    try:
-        config = uvicorn.Config("reply_server:app", host=host, port=port, log_level="info")
-        server = uvicorn.Server(config)
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(server.serve())
-    except Exception as e:
-        logger.error(f"uvicorn服务器启动失败: {e}")
-        try:
-            # 确保线程内事件循环被正确关闭
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                loop.stop()
-        except Exception:
-            pass
-
-
+    uvicorn.run("reply_server:app", host=host, port=port, log_level="info")
 
 
 def load_keywords_file(path: str):
@@ -184,6 +88,123 @@ def load_keywords_file(path: str):
     return kw_list
 
 
+async def _cookiecloud_refresh_loop(manager: "cm.CookieManager",
+                                    cookie_id: str,
+                                    host: str,
+                                    uuid: str,
+                                    password: str,
+                                    refresh_seconds: int):
+    """
+    后台定时从 CookieCloud 拉取并覆盖指定账号 Cookie。
+    - 若拉取失败则跳过该轮，保留现有 Cookie。
+    - 若成功，则调用 manager.update_cookie 以热重启该账号任务。
+    """
+    if not fetch_cookiecloud_cookie_str:
+        logger.warning("CookieCloud 模块不可用，停止刷新循环")
+        return
+
+    refresh_seconds = max(60, int(refresh_seconds or 1800))  # 最小 60 秒
+    logger.info(f"CookieCloud 刷新任务已启动：账号={cookie_id}，间隔={refresh_seconds}s")
+
+    while True:
+        try:
+            await asyncio.sleep(refresh_seconds)
+            cookies_str = await fetch_cookiecloud_cookie_str(host, uuid, password, timeout=20)
+            if not cookies_str:
+                logger.warning("CookieCloud 刷新失败，本轮跳过")
+                continue
+
+            logger.info(f"CookieCloud 刷新成功，准备覆盖账号 {cookie_id} 的 Cookie")
+            # 如任务已启动，用更新接口热重启；否则只更新数据库与内存，后续由启动流程接管
+            if cookie_id in getattr(manager, "tasks", {}):
+                manager.update_cookie(cookie_id, cookies_str)
+            else:
+                # 未启动阶段：仅覆盖内存与数据库
+                try:
+                    details = db_manager.get_cookie_details(cookie_id)
+                    user_id = details.get('user_id') if details else None
+                except Exception:
+                    user_id = None
+                db_manager.save_cookie(cookie_id, cookies_str, user_id)
+                manager.cookies[cookie_id] = cookies_str
+                logger.info(f"已覆盖数据库与内存中的 Cookie（未启动阶段）: {cookie_id}")
+        except asyncio.CancelledError:
+            logger.info("CookieCloud 刷新任务已取消")
+            break
+        except Exception as e:
+            logger.error(f"CookieCloud 周期刷新异常: {e}")
+
+
+async def _setup_cookiecloud_before_start(manager: "cm.CookieManager"):
+    """
+    若配置了环境变量（COOKIE_CLOUD_HOST/UUID/PASSWORD），
+    则在启动任务前拉取 Cookie 并覆盖指定账号（默认优先覆盖 'default' 或唯一账号）。
+    之后按 COOKIE_CLOUD_REFRESH_SECONDS 开启后台刷新。
+    未配置时，不做任何改动，沿用原有 Cookie。
+    """
+    if not fetch_cookiecloud_cookie_str:
+        logger.info("未提供 CookieCloud 模块，跳过云端同步")
+        return
+
+    host = (os.getenv("COOKIE_CLOUD_HOST") or "").strip()
+    uuid = (os.getenv("COOKIE_CLOUD_UUID") or "").strip()
+    password = (os.getenv("COOKIE_CLOUD_PASSWORD") or "").strip()
+    refresh_seconds = os.getenv("COOKIE_CLOUD_REFRESH_SECONDS") or os.getenv("COOKIE_CLOUD_REFRESH_INTERVAL") or "1800"
+    cookie_id_env = (os.getenv("COOKIE_CLOUD_COOKIE_ID") or "").strip()
+    refresh_on_token_failure_only = os.getenv("COOKIE_REFRESH_ON_TOKEN_FAILURE_ONLY", "true").lower() in ("true", "1", "t")
+ 
+    # 未配置 CookieCloud，跳过
+    if not host or not uuid:
+        logger.info("未配置 CookieCloud 环境变量，沿用本地 Cookie")
+        return
+
+    try:
+        refresh_seconds = int(refresh_seconds)
+    except Exception:
+        refresh_seconds = 1800
+
+    logger.info("检测到 CookieCloud 配置，开始首次拉取并覆盖本地 Cookie")
+
+    # 选择目标 cookie_id
+    target_cookie_id = None
+    if cookie_id_env:
+        target_cookie_id = cookie_id_env
+    elif "default" in manager.cookies:
+        target_cookie_id = "default"
+    elif len(manager.cookies) == 1:
+        target_cookie_id = list(manager.cookies.keys())[0]
+    else:
+        # 多账号场景且未指定，默认采用 default（不存在则创建）
+        target_cookie_id = "default"
+
+    # 首次拉取
+    cookies_str = await fetch_cookiecloud_cookie_str(host, uuid, password, timeout=20)
+    if not cookies_str:
+        logger.warning("CookieCloud 首次拉取失败，保持原有 Cookie，不开启刷新")
+        return
+
+    # 覆盖数据库与内存中的 Cookie，暂不启动任务（交由后续统一启动逻辑）
+    try:
+        details = db_manager.get_cookie_details(target_cookie_id)
+        user_id = details.get('user_id') if details else None
+    except Exception:
+        user_id = None
+
+    db_manager.save_cookie(target_cookie_id, cookies_str, user_id)
+    manager.cookies[target_cookie_id] = cookies_str
+
+    logger.info(f"CookieCloud 首次同步完成，已覆盖账号 {target_cookie_id} 的 Cookie，长度={len(cookies_str)}")
+
+    # 启动后台刷新任务
+    # 启动后台刷新任务
+    if refresh_seconds > 0 and not refresh_on_token_failure_only:
+        asyncio.create_task(
+            _cookiecloud_refresh_loop(manager, target_cookie_id, host, uuid, password, refresh_seconds)
+        )
+    elif refresh_on_token_failure_only:
+        logger.info("已配置为仅在 Token 刷新失败时更新 Cookie，后台定时刷新已禁用")
+
+
 async def main():
     print("开始启动主程序...")
 
@@ -199,6 +220,12 @@ async def main():
     cm.manager = cm.CookieManager(loop)
     manager = cm.manager
     print("CookieManager 创建完成")
+
+    # 在启动任务前：若环境已配置 CookieCloud，则拉取并覆盖 Cookie（否则保留原逻辑）
+    try:
+        await _setup_cookiecloud_before_start(manager)
+    except Exception as e:
+        logger.error(f"启动前 CookieCloud 同步失败：{e}，将沿用本地 Cookie")
 
     # 1) 从数据库加载的 Cookie 已经在 CookieManager 初始化时完成
     # 为每个启用的 Cookie 启动任务
@@ -225,14 +252,14 @@ async def main():
             logger.error(f"启动 Cookie 任务失败: {cid}, {e}")
             import traceback
             logger.error(f"详细错误信息: {traceback.format_exc()}")
-    
+
     # 2) 如果配置文件中有新的 Cookie，也加载它们
     for entry in COOKIES_LIST:
         cid = entry.get('id')
         val = entry.get('value')
         if not cid or not val or cid in manager.cookies:
             continue
-        
+
         kw_file = entry.get('keywords_file')
         kw_list = load_keywords_file(kw_file) if kw_file else None
         manager.add_cookie(cid, val, kw_list)
@@ -261,16 +288,4 @@ async def main():
 
 
 if __name__ == '__main__':
-    # 避免使用被monkey patch的asyncio.run()
-    # 使用原生的事件循环管理方式
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # 如果事件循环已经在运行，创建任务
-            asyncio.create_task(main())
-        else:
-            # 正常启动事件循环
-            loop.run_until_complete(main())
-    except RuntimeError:
-        # 如果没有事件循环，创建一个新的
-        asyncio.run(main()) 
+    asyncio.run(main())
