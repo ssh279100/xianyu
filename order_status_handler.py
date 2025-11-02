@@ -10,7 +10,7 @@ import uuid
 import threading
 import asyncio
 from loguru import logger
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 # ==================== 订单状态处理器配置 ====================
 # 订单状态处理器配置
@@ -68,6 +68,10 @@ class OrderStatusHandler:
         # 订单状态历史记录 {order_id: [status_history, ...]}
         # 用于退款撤销时回退到上一次状态
         self._order_status_history = {}
+        # 聊天标识与订单ID映射（用于无法直接提取订单ID的系统消息）
+        self._chat_order_map: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        self._chat_order_map_ttl = 48 * 3600  # 映射有效期（秒）
+        self._chat_order_map_max_size = 200    # 单账号映射数量上限，防止内存膨胀
         
         # 使用threading.RLock保护并发访问
         # 注意：虽然在async环境中asyncio.Lock更理想，但本类的所有方法都是同步的
@@ -292,6 +296,23 @@ class OrderStatusHandler:
                     # 记录状态历史（用于退款撤销时回退）
                     self._record_status_history(order_id, current_status, new_status, context)
                     
+                    # 退款/退货成功后将卡券回收
+                    if new_status == 'cancelled':
+                        context_text = context or ''
+                        is_refund_context = any(keyword in context_text for keyword in ['退款', '退货', '退返', 'refund'])
+                        if current_status == 'refunding' or is_refund_context:
+                            try:
+                                recycle_stats = db_manager.recycle_order_deliveries(order_id, context_text)
+                                if recycle_stats.get('recycled'):
+                                    logger.info(
+                                        f"订单 {order_id} 退款成功，已回收 {recycle_stats['recycled']} 个卡券，"
+                                        f"跳过 {recycle_stats['skipped']}，失败 {recycle_stats['errors']}"
+                                    )
+                                else:
+                                    logger.debug(f"订单 {order_id} 退款回收完成，无可回收卡券或全部跳过")
+                            except Exception as recycle_error:
+                                logger.error(f"订单 {order_id} 卡券回收失败: {recycle_error}")
+
                     status_text = self.status_mapping.get(new_status, new_status)
                     if self.config.get('enable_status_logging', True):
                         logger.info(f"✅ 订单状态更新成功: {order_id} -> {status_text} ({context})")
@@ -342,6 +363,258 @@ class OrderStatusHandler:
             return ['所有状态']  # 兼容性
         
         return self.VALID_TRANSITIONS.get(current_status, [])
+
+    def _normalize_identifier_values(self, value: Any) -> List[str]:
+        """标准化聊天相关的标识字符串，生成多个候选键"""
+        identifiers = set()
+        if value is None:
+            return []
+
+        try:
+            if isinstance(value, str):
+                normalized = value.strip()
+                if not normalized:
+                    return []
+                identifiers.add(normalized)
+                if '@' in normalized:
+                    identifiers.add(normalized.split('@')[0])
+                if normalized.endswith('.PNM'):
+                    identifiers.add(normalized.rsplit('.PNM', 1)[0])
+            elif isinstance(value, (int, float)):
+                identifiers.add(str(int(value)))
+        except Exception as e:
+            logger.debug(f"标准化聊天标识失败: {e}")
+
+        return [identifier for identifier in identifiers if identifier]
+
+    def _extract_chat_identifiers(self, message: dict) -> List[str]:
+        """从消息中提取与聊天/会话相关的标识，用于订单ID匹配"""
+        if not isinstance(message, dict):
+            return []
+        identifiers = set()
+
+        try:
+            message_1 = message.get('1')
+            if isinstance(message_1, dict):
+                nested = message_1.get('1')
+                if isinstance(nested, dict):
+                    for key in ('1', '2', '3'):
+                        identifiers.update(self._normalize_identifier_values(nested.get(key)))
+
+                for key in ('2', '3', '4'):
+                    identifiers.update(self._normalize_identifier_values(message_1.get(key)))
+
+                message_10 = message_1.get('10')
+                if isinstance(message_10, dict):
+                    identifiers.update(self._normalize_identifier_values(message_10.get('senderUserId')))
+                    identifiers.update(self._normalize_identifier_values(message_10.get('receiver')))
+                    reminder_url = message_10.get('reminderUrl', '')
+                    if isinstance(reminder_url, str):
+                        for param in ('sid', 'itemId', 'bizOrderId', 'orderId', 'tradeId'):
+                            if f'{param}=' in reminder_url:
+                                value = reminder_url.split(f'{param}=')[1].split('&')[0]
+                                identifiers.update(self._normalize_identifier_values(value))
+            else:
+                identifiers.update(self._normalize_identifier_values(message_1))
+
+            top_level_three = message.get('3')
+            if isinstance(top_level_three, (str, int)):
+                identifiers.update(self._normalize_identifier_values(top_level_three))
+        except Exception as e:
+            logger.debug(f"提取聊天标识失败: {e}")
+
+        return [identifier for identifier in identifiers if identifier]
+
+    def _store_chat_order_mapping(self, order_id: str, cookie_id: str, message: dict):
+        """记录聊天标识与订单ID之间的映射关系"""
+        if not order_id or not cookie_id or not isinstance(message, dict):
+            return
+
+        identifiers = self._extract_chat_identifiers(message)
+        if not identifiers:
+            return
+
+        now = time.time()
+        with self._lock:
+            mapping = self._chat_order_map.setdefault(cookie_id, {})
+
+            # 清理过期的映射
+            expired_keys = [
+                key for key, entry in list(mapping.items())
+                if now - entry.get('timestamp', now) > self._chat_order_map_ttl
+            ]
+            for key in expired_keys:
+                mapping.pop(key, None)
+
+            # 控制映射数量，按时间顺序淘汰
+            if len(mapping) >= self._chat_order_map_max_size:
+                sorted_items = sorted(
+                    mapping.items(),
+                    key=lambda item: item[1].get('timestamp', 0)
+                )
+                overflow = max(0, len(mapping) + len(identifiers) - self._chat_order_map_max_size)
+                if overflow > 0:
+                    for key, _ in sorted_items[:overflow]:
+                        mapping.pop(key, None)
+
+            for identifier in identifiers:
+                mapping[identifier] = {'order_id': order_id, 'timestamp': now}
+
+            logger.debug(f"🧭 聊天映射记录: cookie={cookie_id}, keys={identifiers}, order_id={order_id}")
+
+            if not mapping:
+                self._chat_order_map.pop(cookie_id, None)
+
+    def _lookup_order_id_by_message(self, message: dict, cookie_id: str) -> Optional[str]:
+        """根据聊天标识查找之前记录的订单ID"""
+        if not cookie_id or not isinstance(message, dict):
+            return None
+
+        identifiers = self._extract_chat_identifiers(message)
+        if not identifiers:
+            return None
+
+        now = time.time()
+        with self._lock:
+            mapping = self._chat_order_map.get(cookie_id)
+            if not mapping:
+                return None
+
+            expired_keys = []
+            for identifier in identifiers:
+                entry = mapping.get(identifier)
+                if not entry:
+                    continue
+                if now - entry.get('timestamp', now) > self._chat_order_map_ttl:
+                    expired_keys.append(identifier)
+                    continue
+                order_id = entry.get('order_id')
+                if order_id:
+                    logger.info(f"🔁 根据聊天上下文匹配到订单ID: {order_id} (标识: {identifier})")
+                    return order_id
+
+            for key in expired_keys:
+                mapping.pop(key, None)
+
+            if not mapping:
+                self._chat_order_map.pop(cookie_id, None)
+
+        return None
+
+    def _extract_task_name(self, message: dict) -> Optional[str]:
+        """从系统消息中提取任务名称（taskName）"""
+        try:
+            if not isinstance(message, dict):
+                return None
+
+            message_1 = message.get('1')
+            if not isinstance(message_1, dict):
+                return None
+
+            message_10 = message_1.get('10')
+            if not isinstance(message_10, dict):
+                return None
+
+            biz_tag = message_10.get('bizTag')
+            if not biz_tag:
+                return None
+
+            try:
+                biz_data = json.loads(biz_tag) if isinstance(biz_tag, str) else biz_tag
+                task_name = biz_data.get('taskName')
+                return task_name
+            except Exception as parse_e:
+                logger.debug(f"解析bizTag失败: {parse_e}")
+                return None
+
+        except Exception as e:
+            logger.debug(f"提取taskName失败: {e}")
+            return None
+
+    def _infer_status_from_task_name(self, message: dict, send_message: str) -> Optional[str]:
+        """根据任务名称推断状态"""
+        task_name = self._extract_task_name(message)
+        if not task_name:
+            return None
+
+        task_name = task_name.strip()
+        if not task_name:
+            return None
+
+        # 退款成功/订单关闭
+        cancelled_keywords = ['退款成功', '退货成功', '退货退款成功', '退款退货成功', '关闭订单', '交易关闭', '退款已完成']
+        if any(keyword in task_name for keyword in cancelled_keywords):
+            logger.info(f"🔍 根据taskName推断订单关闭: {task_name}")
+            return 'cancelled'
+
+        # 退款进行中
+        refunding_keywords = ['退款申请已同意', '改为仅退款已同意', '发起退款申请', '申请退款', '退款处理中', '仅退款已同意']
+        if any(keyword in task_name for keyword in refunding_keywords):
+            logger.info(f"🔍 根据taskName推断订单退款中: {task_name}")
+            return 'refunding'
+
+        # 退款撤销
+        refund_cancelled_keywords = ['退款申请已撤销', '退款申请已取消', '取消退款申请']
+        if any(keyword in task_name for keyword in refund_cancelled_keywords):
+            logger.info(f"🔍 根据taskName推断退款撤销: {task_name}")
+            return 'refund_cancelled'
+
+        logger.debug(f"⚪ taskName未匹配到状态: {task_name}")
+        return None
+
+    def _infer_status_from_message(self, send_message: str, message: dict = None) -> Optional[str]:
+        """根据系统消息内容推断订单状态
+
+        Args:
+            send_message: 系统消息文本
+
+        Returns:
+            Optional[str]: 推断出的状态，无法识别返回None
+        """
+        if not send_message:
+            return self._infer_status_from_task_name(message, send_message)
+
+        normalized = send_message.strip()
+        # 去除中英文方括号以及空格
+        normalized = normalized.strip('[]').strip('【】').strip()
+
+        # 退款/退货成功 → 订单关闭
+        if any(keyword in normalized for keyword in ['退款成功', '退货成功', '退货退款成功']) or \
+           any(keyword in normalized for keyword in ['钱款已原路退返', '钱款已退回', '款项已退回', '交易成功，已退款', '交易关闭，已退款']):
+            return 'cancelled'
+
+        # 交易结果附带退款提示 → 订单关闭
+        if '已退款' in normalized and any(keyword in normalized for keyword in ['交易成功', '交易关闭']):
+            return 'cancelled'
+
+        # 同意退款/退货申请 → 退款中
+        if ('退款申请' in normalized or '退货申请' in normalized) and \
+           any(keyword in normalized for keyword in ['已同意', '同意了', '通过了', '同意退款', '同意退货']):
+            return 'refunding'
+
+        # 撤销退款申请 → 退退款撤销（最终回退上一状态）
+        if ('退款申请' in normalized or '退货申请' in normalized) and \
+           any(keyword in normalized for keyword in ['已撤销', '撤销了', '取消了', '已取消']):
+            return 'refund_cancelled'
+
+        # 买家已付款 / 等待发货
+        if any(keyword in normalized for keyword in ['买家已付款', '付款完成', '已付款', '等待你发货', '待发货']):
+            return 'pending_ship'
+
+        # 卖家确认发货
+        if any(keyword in normalized for keyword in ['你已发货', '已发货', '等待买家确认收货']):
+            return 'shipped'
+
+        # 交易完成
+        if any(keyword in normalized for keyword in ['确认收货', '交易成功']):
+            return 'completed'
+
+        # 交易关闭
+        if '交易关闭' in normalized or '关闭了订单' in normalized:
+            return 'cancelled'
+
+        # 最后尝试根据taskName判断
+        return self._infer_status_from_task_name(message, send_message)
     
     def _check_refund_message(self, message: dict, send_message: str) -> Optional[str]:
         """检查退款申请消息，需要同时识别标题和按钮文本
@@ -371,41 +644,67 @@ class OrderStatusHandler:
             
             try:
                 content_data = json.loads(content_json_str)
-                
-                # 检查dynamicOperation中的内容
+
+                # 1) contentType=14 的 Tip 提醒（例如“退款成功，钱款已原路退返”）
+                tip_content = ''
+                if isinstance(content_data, dict):
+                    tip_field = content_data.get('tip')
+                    if isinstance(tip_field, dict):
+                        tip_content = tip_field.get('tip', '')
+                    elif isinstance(tip_field, str):
+                        tip_content = tip_field
+
+                if tip_content:
+                    normalized_tip = tip_content.strip().strip('[]【】')
+                    logger.info(f"🔍 检查退款Tip消息: '{normalized_tip}'")
+
+                    if any(keyword in normalized_tip for keyword in ['退款成功', '钱款已原路退返', '钱款已退回', '退款已完成', '交易关闭，已退款', '交易成功，已退款']):
+                        logger.info("✅ 识别到退款成功提示消息")
+                        return 'cancelled'
+
+                    if ('退款申请' in normalized_tip or '退货申请' in normalized_tip) and any(keyword in normalized_tip for keyword in ['已同意', '同意', '处理中']):
+                        logger.info("ℹ️ 识别到退款处理中提示消息")
+                        return 'refunding'
+
+                # 2) dynamicOperation 卡片消息（例如“我发起了退款申请”）
                 dynamic_content = content_data.get('dynamicOperation', {}).get('changeContent', {})
-                if not dynamic_content:
-                    return None
-                
-                dx_card = dynamic_content.get('dxCard', {}).get('item', {}).get('main', {})
-                if not dx_card:
-                    return None
-                
-                ex_content = dx_card.get('exContent', {})
-                if not ex_content:
-                    return None
-                
-                # 获取标题和按钮文本
-                title = ex_content.get('title', '')
-                button_text = ex_content.get('button', {}).get('text', '')
-                
-                logger.info(f"🔍 检查退款消息 - 标题: '{title}', 按钮: '{button_text}'")
-                
-                # 检查是否是退款申请且已同意
-                if title == '我发起了退款申请' and button_text == '已同意':
-                    logger.info(f"✅ 识别到退款申请已同意消息")
-                    return 'refunding'
-                
-                # 检查是否是退款撤销（买家主动撤销）
-                if title == '我发起了退款申请' and button_text == '已撤销':
-                    logger.info(f"✅ 识别到退款撤销消息")
-                    return 'refund_cancelled'
-                
-                # 退款申请被拒绝不需要改变状态，因为没同意
-                # if title == '我发起了退款申请' and button_text == '已拒绝':
-                #     logger.info(f"ℹ️ 识别到退款申请被拒绝消息，不改变订单状态")
-                #     return None
-                
+                if dynamic_content:
+                    dx_card = dynamic_content.get('dxCard', {}).get('item', {}).get('main', {})
+                    ex_content = dx_card.get('exContent', {}) if isinstance(dx_card, dict) else {}
+
+                    title = ex_content.get('title', '') if isinstance(ex_content, dict) else ''
+                    button_text = ex_content.get('button', {}).get('text', '') if isinstance(ex_content.get('button', {}), dict) else ex_content.get('button', '') if isinstance(ex_content.get('button', {}), str) else ''
+
+                    if title or button_text:
+                        logger.info(f"🔍 检查退款消息 - 标题: '{title}', 按钮: '{button_text}'")
+
+                    if title == '我发起了退款申请' and button_text == '已同意':
+                        logger.info("✅ 识别到退款申请已同意消息")
+                        return 'refunding'
+
+                    if title == '我发起了退款申请' and button_text == '已撤销':
+                        logger.info("✅ 识别到退款撤销消息")
+                        return 'refund_cancelled'
+
+                # 3) 兜底：detailNotice / reminderContent 中可能直接包含提示
+                detail_notice = message.get('10', {}).get('detailNotice') if isinstance(message.get('10'), dict) else ''
+                reminder_content = message.get('10', {}).get('reminderContent') if isinstance(message.get('10'), dict) else ''
+
+                for extra_text in filter(None, [detail_notice, reminder_content]):
+                    normalized_extra = str(extra_text).strip().strip('[]【】')
+                    if not normalized_extra:
+                        continue
+
+                    logger.info(f"🔍 检查退款提示文本: '{normalized_extra}'")
+
+                    if any(keyword in normalized_extra for keyword in ['退款成功', '钱款已原路退返', '钱款已退回', '退款已完成', '交易关闭，已退款', '交易成功，已退款']):
+                        logger.info("✅ 识别到退款成功提示文本")
+                        return 'cancelled'
+
+                    if ('退款申请' in normalized_extra or '退货申请' in normalized_extra) and any(keyword in normalized_extra for keyword in ['已同意', '处理中', '待处理']):
+                        logger.info("ℹ️ 识别到退款处理中提示文本")
+                        return 'refunding'
+
             except Exception as parse_e:
                 logger.debug(f"解析退款消息JSON失败: {parse_e}")
                 return None
@@ -666,48 +965,52 @@ class OrderStatusHandler:
             elif send_message in message_status_mapping:
                 new_status = message_status_mapping[send_message]
             else:
-                return False
-            
-            # 提取订单ID
-            order_id = self.extract_order_id(message)
-            if not order_id:
-                # 如果无法提取订单ID，根据配置决定是否添加到待处理队列
-                if self.config.get('use_pending_queue', True):
-                    logger.info(f'[{msg_time}] 【{cookie_id}】{send_message}，暂时无法提取订单ID，添加到待处理队列')
+                inferred_status = self._infer_status_from_message(send_message, message)
+                if inferred_status:
+                    logger.info(f"🔍 根据系统消息推断订单状态: {send_message} -> {inferred_status}")
+                    new_status = inferred_status
                 else:
-                    logger.error(f'[{msg_time}] 【{cookie_id}】{send_message}，无法提取订单ID且未启用待处理队列，跳过处理')
-                return False
-                
-                # 创建一个临时的订单ID占位符，用于标识这个待处理的状态更新
-                temp_order_id = f"temp_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
-                
-                # 获取对应的状态
-                new_status = message_status_mapping[send_message]
-                
-                # 添加到待处理队列，使用特殊标记
-                self._add_to_pending_updates(
-                    order_id=temp_order_id,
-                    new_status=new_status,
-                    cookie_id=cookie_id,
-                    context=f"{send_message} - {msg_time} - 等待订单ID提取"
-                )
-                
-                # 添加到待处理的系统消息队列
-                if cookie_id not in self._pending_system_messages:
-                    self._pending_system_messages[cookie_id] = []
-                
-                self._pending_system_messages[cookie_id].append({
-                    'message': message,
-                    'send_message': send_message,
-                    'cookie_id': cookie_id,
-                    'msg_time': msg_time,
-                    'new_status': new_status,
-                    'temp_order_id': temp_order_id,
-                    'message_hash': hash(str(sorted(message.items()))) if isinstance(message, dict) else hash(str(message)),  # 添加消息哈希用于匹配
-                    'timestamp': time.time()  # 添加时间戳用于清理
-                })
-                
-                return True
+                    logger.debug(f"⚪ 未识别的系统消息，不更新订单状态: {send_message}")
+                    return False
+            # 提取订单ID，或根据聊天上下文回退匹配
+            order_id = self.extract_order_id(message)
+            if order_id:
+                self._store_chat_order_mapping(order_id, cookie_id, message)
+            else:
+                order_id = self._lookup_order_id_by_message(message, cookie_id)
+                if order_id:
+                    self._store_chat_order_mapping(order_id, cookie_id, message)
+                else:
+                    if not self.config.get('use_pending_queue', True):
+                        logger.error(f'[{msg_time}] 【{cookie_id}】{send_message}，无法提取订单ID且未启用待处理队列，跳过处理')
+                        return False
+
+                    logger.info(f'[{msg_time}] 【{cookie_id}】{send_message}，暂时无法提取订单ID，添加到待处理队列')
+
+                    temp_order_id = f"temp_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
+
+                    self._add_to_pending_updates(
+                        order_id=temp_order_id,
+                        new_status=new_status,
+                        cookie_id=cookie_id,
+                        context=f"{send_message} - {msg_time} - 等待订单ID提取"
+                    )
+
+                    if cookie_id not in self._pending_system_messages:
+                        self._pending_system_messages[cookie_id] = []
+
+                    self._pending_system_messages[cookie_id].append({
+                        'message': message,
+                        'send_message': send_message,
+                        'cookie_id': cookie_id,
+                        'msg_time': msg_time,
+                        'new_status': new_status,
+                        'temp_order_id': temp_order_id,
+                        'message_hash': hash(str(sorted(message.items()))) if isinstance(message, dict) else hash(str(message)),
+                        'timestamp': time.time()
+                    })
+
+                    return True
             
             # 获取对应的状态（new_status已经在上面通过_check_refund_message或message_status_mapping确定了）
             
@@ -749,44 +1052,46 @@ class OrderStatusHandler:
             if red_reminder != '交易关闭':
                 return False
             
-            # 提取订单ID
+            # 提取订单ID，或根据聊天上下文回退匹配
             order_id = self.extract_order_id(message)
-            if not order_id:
-                # 如果无法提取订单ID，根据配置决定是否添加到待处理队列
-                if self.config.get('use_pending_queue', True):
-                    logger.info(f'[{msg_time}] 【{cookie_id}】交易关闭，暂时无法提取订单ID，添加到待处理队列')
+            if order_id:
+                self._store_chat_order_mapping(order_id, cookie_id, message)
+            else:
+                order_id = self._lookup_order_id_by_message(message, cookie_id)
+                if order_id:
+                    self._store_chat_order_mapping(order_id, cookie_id, message)
                 else:
-                    logger.error(f'[{msg_time}] 【{cookie_id}】交易关闭，无法提取订单ID且未启用待处理队列，跳过处理')
-                return False
-                
-                # 创建一个临时的订单ID占位符，用于标识这个待处理的状态更新
-                temp_order_id = f"temp_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
-                
-                # 添加到待处理队列，使用特殊标记
-                self._add_to_pending_updates(
-                    order_id=temp_order_id,
-                    new_status='cancelled',
-                    cookie_id=cookie_id,
-                    context=f"交易关闭 - 用户{user_id} - {msg_time} - 等待订单ID提取"
-                )
-                
-                # 添加到待处理的红色提醒消息队列
-                if cookie_id not in self._pending_red_reminder_messages:
-                    self._pending_red_reminder_messages[cookie_id] = []
-                
-                self._pending_red_reminder_messages[cookie_id].append({
-                    'message': message,
-                    'red_reminder': red_reminder,
-                    'user_id': user_id,
-                    'cookie_id': cookie_id,
-                    'msg_time': msg_time,
-                    'new_status': 'cancelled',
-                    'temp_order_id': temp_order_id,
-                    'message_hash': hash(str(sorted(message.items()))) if isinstance(message, dict) else hash(str(message)),  # 添加消息哈希用于匹配
-                    'timestamp': time.time()  # 添加时间戳用于清理
-                })
-                
-                return True
+                    if not self.config.get('use_pending_queue', True):
+                        logger.error(f'[{msg_time}] 【{cookie_id}】交易关闭，无法提取订单ID且未启用待处理队列，跳过处理')
+                        return False
+
+                    logger.info(f'[{msg_time}] 【{cookie_id}】交易关闭，暂时无法提取订单ID，添加到待处理队列')
+
+                    temp_order_id = f"temp_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
+
+                    self._add_to_pending_updates(
+                        order_id=temp_order_id,
+                        new_status='cancelled',
+                        cookie_id=cookie_id,
+                        context=f"交易关闭 - 用户{user_id} - {msg_time} - 等待订单ID提取"
+                    )
+
+                    if cookie_id not in self._pending_red_reminder_messages:
+                        self._pending_red_reminder_messages[cookie_id] = []
+
+                    self._pending_red_reminder_messages[cookie_id].append({
+                        'message': message,
+                        'red_reminder': red_reminder,
+                        'user_id': user_id,
+                        'cookie_id': cookie_id,
+                        'msg_time': msg_time,
+                        'new_status': 'cancelled',
+                        'temp_order_id': temp_order_id,
+                        'message_hash': hash(str(sorted(message.items()))) if isinstance(message, dict) else hash(str(message)),
+                        'timestamp': time.time()
+                    })
+
+                    return True
             
             # 更新订单状态为已关闭
             success = self.update_order_status(
@@ -930,6 +1235,9 @@ class OrderStatusHandler:
             message: 原始消息（可选，用于匹配）
         """
         logger.info(f"🔄 订单状态处理器.on_order_id_extracted开始: order_id={order_id}, cookie_id={cookie_id}")
+
+        if message:
+            self._store_chat_order_mapping(order_id, cookie_id, message)
         
         with self._lock:
             # 检查是否启用待处理队列

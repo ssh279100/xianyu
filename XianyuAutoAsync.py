@@ -891,7 +891,11 @@ class XianyuLive:
                     quantity_to_send = 1  # 默认发送1个
 
                     # 检查商品是否开启了多数量发货
-                    multi_quantity_delivery = db_manager.get_item_multi_quantity_delivery_status(self.cookie_id, item_id)
+                    multi_quantity_setting = db_manager.get_item_multi_quantity_delivery_status(self.cookie_id, item_id)
+                    if multi_quantity_setting is None:
+                        multi_quantity_delivery = default_multi_quantity_delivery
+                    else:
+                        multi_quantity_delivery = multi_quantity_setting
 
                     if multi_quantity_delivery and order_id:
                         logger.info(f"商品 {item_id} 开启了多数量发货，获取订单详情...")
@@ -3689,12 +3693,12 @@ class XianyuLive:
                             if success and self.order_status_handler:
                                 logger.info(f"【{self.cookie_id}】准备调用订单状态处理器.handle_order_detail_fetched_status: {order_id}")
                                 try:
-                                    result = self.order_status_handler.handle_order_detail_fetched_status(
+                                    handler_result = self.order_status_handler.handle_order_detail_fetched_status(
                                         order_id=order_id,
                                         cookie_id=self.cookie_id,
                                         context="订单详情已拉取"
                                     )
-                                    logger.info(f"【{self.cookie_id}】订单状态处理器.handle_order_detail_fetched_status返回结果: {result}")
+                                    logger.info(f"【{self.cookie_id}】订单状态处理器.handle_order_detail_fetched_status返回结果: {handler_result}")
                                     
                                     # 处理待处理队列
                                     logger.info(f"【{self.cookie_id}】准备调用订单状态处理器.on_order_details_fetched: {order_id}")
@@ -3729,6 +3733,10 @@ class XianyuLive:
         """自动发货功能 - 获取卡券规则，执行延时，确认发货，发送内容"""
         try:
             from db_manager import db_manager
+            from config import config
+
+            auto_delivery_config = config.get('AUTO_DELIVERY', {})
+            default_multi_quantity_delivery = auto_delivery_config.get('multi_quantity_default_enabled', False)
 
             logger.info(f"开始自动发货检查: 商品ID={item_id}")
 
@@ -3986,25 +3994,30 @@ class XianyuLive:
                 logger.info(f"开始处理发货内容，规则: {rule['keyword']} -> {rule['card_name']} ({rule['card_type']})")
 
                 delivery_content = None
+                raw_delivery_content = None
 
                 # 根据卡券类型处理发货内容
                 if rule['card_type'] == 'api':
                     # API类型：调用API获取内容，传入订单和商品信息用于动态参数替换
                     delivery_content = await self._get_api_card_content(rule, order_id, item_id, send_user_id, spec_name, spec_value)
+                    raw_delivery_content = delivery_content
 
                 elif rule['card_type'] == 'text':
                     # 固定文字类型：直接使用文字内容
                     delivery_content = rule['text_content']
+                    raw_delivery_content = delivery_content
 
                 elif rule['card_type'] == 'data':
                     # 批量数据类型：获取并消费第一条数据
                     delivery_content = db_manager.consume_batch_data(rule['card_id'])
+                    raw_delivery_content = delivery_content
 
                 elif rule['card_type'] == 'image':
                     # 图片类型：返回图片发送标记，包含卡券ID
                     image_url = rule.get('image_url')
                     if image_url:
                         delivery_content = f"__IMAGE_SEND__{rule['card_id']}|{image_url}"
+                        raw_delivery_content = image_url
                         logger.info(f"准备发送图片: {image_url} (卡券ID: {rule['card_id']})")
                     else:
                         logger.error(f"图片卡券缺少图片URL: 卡券ID={rule['card_id']}")
@@ -4013,6 +4026,18 @@ class XianyuLive:
                 if delivery_content:
                     # 处理备注信息和变量替换
                     final_content = self._process_delivery_content_with_description(delivery_content, rule.get('card_description', ''))
+
+                    if order_id:
+                        recorded = db_manager.record_order_delivery(
+                            order_id=order_id,
+                            card_id=rule.get('card_id'),
+                            card_type=rule.get('card_type'),
+                            raw_content=raw_delivery_content or delivery_content,
+                            final_content=final_content,
+                            cookie_id=self.cookie_id
+                        )
+                        if not recorded:
+                            logger.warning(f"记录订单发货内容失败: order_id={order_id}, card_id={rule.get('card_id')}")
 
                     # 增加发货次数统计
                     db_manager.increment_delivery_times(rule['id'])

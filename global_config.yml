@@ -18,6 +18,8 @@ AUTO_REPLY:
   enabled: true
   max_retry: 3
   retry_interval: 5
+AUTO_DELIVERY:
+  multi_quantity_default_enabled: true  # 默认根据订单数量发送对应数量的卡券
 ITEM_DETAIL:
   auto_fetch:
     enabled: true  # 是否启用自动获取商品详情

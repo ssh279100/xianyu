@@ -234,6 +234,36 @@ class DBManager:
             )
             ''')
 
+            # 创建订单发货记录表
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS order_delivery_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id TEXT NOT NULL,
+                card_id INTEGER,
+                card_type TEXT,
+                raw_content TEXT,
+                final_content TEXT,
+                status TEXT DEFAULT 'delivered',
+                cookie_id TEXT,
+                sequence INTEGER DEFAULT 1,
+                delivered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                recycled_at TIMESTAMP,
+                recycle_reason TEXT,
+                FOREIGN KEY (order_id) REFERENCES orders(order_id) ON DELETE CASCADE,
+                FOREIGN KEY (card_id) REFERENCES cards(id) ON DELETE SET NULL
+            )
+            ''')
+
+            cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_order_delivery_records_order
+            ON order_delivery_records(order_id)
+            ''')
+
+            cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_order_delivery_records_status
+            ON order_delivery_records(status)
+            ''')
+
             # 检查并添加 user_id 列（用于数据库迁移）
             try:
                 self._execute_sql(cursor, "SELECT user_id FROM cards LIMIT 1")
@@ -3524,6 +3554,140 @@ class DBManager:
                 self.conn.rollback()
                 return None
 
+
+    def requeue_batch_data(self, card_id: int, content: str, commit: bool = True) -> bool:
+        """将指定内容追加回批量数据的末尾，用于退货回收"""
+        cleaned_content = (content or '').strip()
+        if not cleaned_content:
+            logger.warning(f"回收批量数据失败: 卡券ID={card_id}, 内容为空")
+            return False
+
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute("SELECT data_content FROM cards WHERE id = ? AND type = 'data'", (card_id,))
+                row = cursor.fetchone()
+
+                if not row:
+                    logger.warning(f"回收批量数据失败: 未找到数据卡券 {card_id}")
+                    return False
+
+                existing_content = row[0] or ''
+                lines = [line.strip() for line in existing_content.split('\n') if line.strip()]
+                lines.append(cleaned_content)
+
+                new_content = '\n'.join(lines)
+
+                cursor.execute('''
+                UPDATE cards
+                SET data_content = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                ''', (new_content, card_id))
+
+                if commit:
+                    self.conn.commit()
+
+                logger.info(f"批量数据回收成功: 卡券ID={card_id}, 当前总数={len(lines)}")
+                return True
+
+            except Exception as e:
+                logger.error(f"批量数据回收失败: 卡券ID={card_id}, 错误: {e}")
+                if commit:
+                    self.conn.rollback()
+                return False
+
+
+    def record_order_delivery(self, order_id: str, card_id: Optional[int], card_type: Optional[str],
+                              raw_content: Optional[str], final_content: Optional[str],
+                              cookie_id: Optional[str] = None) -> bool:
+        """记录订单发货的卡券内容"""
+        cleaned_raw = raw_content.strip() if raw_content else None
+        cleaned_final = final_content.strip() if final_content else None
+
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                SELECT COALESCE(MAX(sequence), 0) + 1
+                FROM order_delivery_records
+                WHERE order_id = ?
+                ''', (order_id,))
+
+                next_sequence_row = cursor.fetchone()
+                next_sequence = 1
+                if next_sequence_row and next_sequence_row[0]:
+                    next_sequence = int(next_sequence_row[0])
+
+                cursor.execute('''
+                INSERT INTO order_delivery_records
+                (order_id, card_id, card_type, raw_content, final_content, cookie_id, sequence)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (order_id, card_id, card_type, cleaned_raw, cleaned_final, cookie_id, next_sequence))
+
+                self.conn.commit()
+                logger.debug(f"记录订单发货内容成功: order_id={order_id}, card_id={card_id}, sequence={next_sequence}")
+                return True
+
+            except Exception as e:
+                logger.error(f"记录订单发货内容失败: order_id={order_id}, card_id={card_id}, 错误: {e}")
+                self.conn.rollback()
+                return False
+
+
+    def recycle_order_deliveries(self, order_id: str, reason: str = "") -> Dict[str, int]:
+        """回收指定订单的发货卡券（用于退款/退货）"""
+        stats = {'total': 0, 'recycled': 0, 'skipped': 0, 'errors': 0}
+
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                SELECT id, card_id, card_type, raw_content
+                FROM order_delivery_records
+                WHERE order_id = ? AND status = 'delivered'
+                ORDER BY sequence ASC
+                ''', (order_id,))
+
+                records = cursor.fetchall()
+                stats['total'] = len(records)
+
+                if not records:
+                    return stats
+
+                for record_id, card_id, card_type, raw_content in records:
+                    if card_type == 'data' and card_id and raw_content:
+                        success = self.requeue_batch_data(card_id, raw_content, commit=False)
+                        if success:
+                            cursor.execute('''
+                            UPDATE order_delivery_records
+                            SET status = 'recycled', recycled_at = CURRENT_TIMESTAMP, recycle_reason = ?
+                            WHERE id = ?
+                            ''', (reason, record_id))
+                            stats['recycled'] += 1
+                        else:
+                            cursor.execute('''
+                            UPDATE order_delivery_records
+                            SET status = 'recycle_failed', recycled_at = CURRENT_TIMESTAMP, recycle_reason = ?
+                            WHERE id = ?
+                            ''', (reason, record_id))
+                            stats['errors'] += 1
+                    else:
+                        cursor.execute('''
+                        UPDATE order_delivery_records
+                        SET status = 'non_recyclable', recycled_at = CURRENT_TIMESTAMP, recycle_reason = ?
+                        WHERE id = ?
+                        ''', (reason, record_id))
+                        stats['skipped'] += 1
+
+                self.conn.commit()
+
+            except Exception as e:
+                logger.error(f"回收订单发货卡券失败: order_id={order_id}, 错误: {e}")
+                self.conn.rollback()
+
+        return stats
+
+
     # ==================== 商品信息管理 ====================
 
     def save_item_basic_info(self, cookie_id: str, item_id: str, item_title: str = None,
@@ -3814,8 +3978,8 @@ class DBManager:
             self.conn.rollback()
             return False
 
-    def get_item_multi_quantity_delivery_status(self, cookie_id: str, item_id: str) -> bool:
-        """获取商品的多数量发货状态"""
+    def get_item_multi_quantity_delivery_status(self, cookie_id: str, item_id: str) -> Optional[bool]:
+        """获取商品的多数量发货状态，未设置时返回None"""
         try:
             with self.lock:
                 cursor = self.conn.cursor()
@@ -3825,13 +3989,17 @@ class DBManager:
                 ''', (cookie_id, item_id))
 
                 row = cursor.fetchone()
-                if row:
-                    return bool(row[0]) if row[0] is not None else False
-                return False
+                if not row:
+                    return None
+
+                value = row[0]
+                if value is None:
+                    return None
+                return bool(value)
 
         except Exception as e:
             logger.error(f"获取商品多数量发货状态失败: {e}")
-            return False
+            return None
 
     def get_items_by_cookie(self, cookie_id: str) -> List[Dict]:
         """获取指定Cookie的所有商品信息

@@ -8638,6 +8638,10 @@ function getOrderStatusClass(status) {
     const statusMap = {
         'processing': 'bg-warning text-dark',
         'processed': 'bg-info text-white',
+        'pending_ship': 'bg-warning text-dark',
+        'shipped': 'bg-primary text-white',
+        'refunding': 'bg-warning text-dark',
+        'refund_cancelled': 'bg-secondary text-white',
         'completed': 'bg-success text-white',
         'cancelled': 'bg-danger text-white',
         'unknown': 'bg-secondary text-white'
@@ -8650,7 +8654,10 @@ function getOrderStatusText(status) {
     const statusMap = {
         'processing': '处理中',
         'processed': '已处理',
+        'pending_ship': '待发货',
         'shipped': '已发货',
+        'refunding': '退款中',
+        'refund_cancelled': '退款撤销',
         'completed': '已完成',
         'cancelled': '已关闭',
         'unknown': '未知'
@@ -9342,7 +9349,8 @@ const tableDescriptions = {
     'system_settings': '系统设置表',
     'email_verifications': '邮箱验证表',
     'captcha_codes': '验证码表',
-    'orders': '订单表'
+    'orders': '订单表',
+    'order_delivery_records': '订单发货记录表'
 };
 
 // 加载数据管理页面
