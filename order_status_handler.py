@@ -541,6 +541,14 @@ class OrderStatusHandler:
         if not task_name:
             return None
 
+        if '退款申请已同意' in task_name and '退货' not in task_name and '改为' not in task_name:
+            logger.info(f"🔍 根据taskName推断仅退款申请已同意，直接判为订单关闭: {task_name}")
+            return 'cancelled'
+
+        if '仅退款已同意' in task_name and '退货' not in task_name and '改为' not in task_name:
+            logger.info(f"🔍 根据taskName推断仅退款已同意，直接判为订单关闭: {task_name}")
+            return 'cancelled'
+
         # 退款成功/订单关闭
         cancelled_keywords = ['退款成功', '退货成功', '退货退款成功', '退款退货成功', '关闭订单', '交易关闭', '退款已完成', '交易成功，有退款', '交易成功，已退款']
         if any(keyword in task_name for keyword in cancelled_keywords):
@@ -548,7 +556,7 @@ class OrderStatusHandler:
             return 'cancelled'
 
         # 退款进行中
-        refunding_keywords = ['退款申请已同意', '改为仅退款已同意', '发起退款申请', '申请退款', '退款处理中', '仅退款已同意']
+        refunding_keywords = ['改为仅退款已同意', '发起退款申请', '申请退款', '退款处理中']
         if any(keyword in task_name for keyword in refunding_keywords):
             logger.info(f"🔍 根据taskName推断订单退款中: {task_name}")
             return 'refunding'
@@ -678,13 +686,22 @@ class OrderStatusHandler:
                     if title or button_text:
                         logger.info(f"🔍 检查退款消息 - 标题: '{title}', 按钮: '{button_text}'")
 
-                    if title == '我发起了退款申请' and button_text == '已同意':
-                        logger.info("✅ 识别到退款申请已同意消息")
-                        return 'refunding'
-
                     if title == '我发起了退款申请' and button_text == '已撤销':
                         logger.info("✅ 识别到退款撤销消息")
                         return 'refund_cancelled'
+
+                    if title and '退货' in title and button_text == '已同意':
+                        logger.info("✅ 识别到退货退款申请已同意消息，继续等待退款完成")
+                        return 'refunding'
+
+                    if title and '退款' in title and button_text in ('已同意', '同意退款'):
+                        task_name = self._extract_task_name(message) or ''
+                        if task_name and any(keyword in task_name for keyword in ['退货', '退货退款']):
+                            logger.info("ℹ️ 识别到退货相关退款申请已同意消息，保持退款中")
+                            return 'refunding'
+
+                        logger.info("✅ 识别到仅退款申请已同意消息，标记订单关闭")
+                        return 'cancelled'
 
                 # 3) 兜底：detailNotice / reminderContent 中可能直接包含提示
                 detail_notice = message.get('10', {}).get('detailNotice') if isinstance(message.get('10'), dict) else ''
