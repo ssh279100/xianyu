@@ -3555,48 +3555,6 @@ class DBManager:
                 return None
 
 
-    def requeue_batch_data(self, card_id: int, content: str, commit: bool = True) -> bool:
-        """将指定内容追加回批量数据的末尾，用于退货回收"""
-        cleaned_content = (content or '').strip()
-        if not cleaned_content:
-            logger.warning(f"回收批量数据失败: 卡券ID={card_id}, 内容为空")
-            return False
-
-        with self.lock:
-            try:
-                cursor = self.conn.cursor()
-                cursor.execute("SELECT data_content FROM cards WHERE id = ? AND type = 'data'", (card_id,))
-                row = cursor.fetchone()
-
-                if not row:
-                    logger.warning(f"回收批量数据失败: 未找到数据卡券 {card_id}")
-                    return False
-
-                existing_content = row[0] or ''
-                lines = [line.strip() for line in existing_content.split('\n') if line.strip()]
-                lines.append(cleaned_content)
-
-                new_content = '\n'.join(lines)
-
-                cursor.execute('''
-                UPDATE cards
-                SET data_content = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                ''', (new_content, card_id))
-
-                if commit:
-                    self.conn.commit()
-
-                logger.info(f"批量数据回收成功: 卡券ID={card_id}, 当前总数={len(lines)}")
-                return True
-
-            except Exception as e:
-                logger.error(f"批量数据回收失败: 卡券ID={card_id}, 错误: {e}")
-                if commit:
-                    self.conn.rollback()
-                return False
-
-
     def record_order_delivery(self, order_id: str, card_id: Optional[int], card_type: Optional[str],
                               raw_content: Optional[str], final_content: Optional[str],
                               cookie_id: Optional[str] = None) -> bool:
@@ -3635,57 +3593,9 @@ class DBManager:
 
 
     def recycle_order_deliveries(self, order_id: str, reason: str = "") -> Dict[str, int]:
-        """回收指定订单的发货卡券（用于退款/退货）"""
-        stats = {'total': 0, 'recycled': 0, 'skipped': 0, 'errors': 0}
-
-        with self.lock:
-            try:
-                cursor = self.conn.cursor()
-                cursor.execute('''
-                SELECT id, card_id, card_type, raw_content
-                FROM order_delivery_records
-                WHERE order_id = ? AND status = 'delivered'
-                ORDER BY sequence ASC
-                ''', (order_id,))
-
-                records = cursor.fetchall()
-                stats['total'] = len(records)
-
-                if not records:
-                    return stats
-
-                for record_id, card_id, card_type, raw_content in records:
-                    if card_type == 'data' and card_id and raw_content:
-                        success = self.requeue_batch_data(card_id, raw_content, commit=False)
-                        if success:
-                            cursor.execute('''
-                            UPDATE order_delivery_records
-                            SET status = 'recycled', recycled_at = CURRENT_TIMESTAMP, recycle_reason = ?
-                            WHERE id = ?
-                            ''', (reason, record_id))
-                            stats['recycled'] += 1
-                        else:
-                            cursor.execute('''
-                            UPDATE order_delivery_records
-                            SET status = 'recycle_failed', recycled_at = CURRENT_TIMESTAMP, recycle_reason = ?
-                            WHERE id = ?
-                            ''', (reason, record_id))
-                            stats['errors'] += 1
-                    else:
-                        cursor.execute('''
-                        UPDATE order_delivery_records
-                        SET status = 'non_recyclable', recycled_at = CURRENT_TIMESTAMP, recycle_reason = ?
-                        WHERE id = ?
-                        ''', (reason, record_id))
-                        stats['skipped'] += 1
-
-                self.conn.commit()
-
-            except Exception as e:
-                logger.error(f"回收订单发货卡券失败: order_id={order_id}, 错误: {e}")
-                self.conn.rollback()
-
-        return stats
+        """卡券回收功能已停用，返回默认统计结果"""
+        logger.debug(f"卡券回收功能已禁用，忽略订单 {order_id} 的回收请求: {reason}")
+        return {'total': 0, 'recycled': 0, 'skipped': 0, 'errors': 0}
 
 
     # ==================== 商品信息管理 ====================

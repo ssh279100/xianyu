@@ -296,23 +296,6 @@ class OrderStatusHandler:
                     # 记录状态历史（用于退款撤销时回退）
                     self._record_status_history(order_id, current_status, new_status, context)
                     
-                    # 退款/退货成功后将卡券回收
-                    if new_status == 'cancelled':
-                        context_text = context or ''
-                        is_refund_context = any(keyword in context_text for keyword in ['退款', '退货', '退返', 'refund'])
-                        if current_status == 'refunding' or is_refund_context:
-                            try:
-                                recycle_stats = db_manager.recycle_order_deliveries(order_id, context_text)
-                                if recycle_stats.get('recycled'):
-                                    logger.info(
-                                        f"订单 {order_id} 退款成功，已回收 {recycle_stats['recycled']} 个卡券，"
-                                        f"跳过 {recycle_stats['skipped']}，失败 {recycle_stats['errors']}"
-                                    )
-                                else:
-                                    logger.debug(f"订单 {order_id} 退款回收完成，无可回收卡券或全部跳过")
-                            except Exception as recycle_error:
-                                logger.error(f"订单 {order_id} 卡券回收失败: {recycle_error}")
-
                     status_text = self.status_mapping.get(new_status, new_status)
                     if self.config.get('enable_status_logging', True):
                         logger.info(f"✅ 订单状态更新成功: {order_id} -> {status_text} ({context})")
