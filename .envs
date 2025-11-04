@@ -1,0 +1,30 @@
+# CookieCloud 环境变量示例
+
+将本示例中的键值写入部署环境（如 Docker Compose、系统环境变量或 `.env` 文件），即可让项目启动时自动从 CookieCloud 拉取最新 Cookie。
+
+```
+# CookieCloud 服务地址（需包含协议与端口，例如 http://192.168.1.10:8088）
+COOKIE_CLOUD_HOST=
+
+# Chrome CookieCloud 插件页面中的 UUID
+COOKIE_CLOUD_UUID=
+
+# 插件生成的同步密码（注意与登录密码不同）
+COOKIE_CLOUD_PASSWORD=
+
+# 可选：指定被覆盖的账号 ID，缺省时自动选择 default 或唯一账号
+#COOKIE_CLOUD_COOKIE_ID=default
+
+# 可选：定时刷新间隔（秒）。默认 1800；设为 0 表示仅在 Token 失败时刷新
+#COOKIE_CLOUD_REFRESH_SECONDS=1800
+
+# 可选：仅在 Token 刷新失败时向 CookieCloud 请求最新 Cookie，默认 true
+#COOKIE_REFRESH_ON_TOKEN_FAILURE_ONLY=true
+
+# 可选：覆盖 Web/API 服务监听地址
+#API_HOST=0.0.0.0
+#API_PORT=8080
+```
+
+> **提示**：如果通过 Docker Compose 部署，可在 `docker-compose.yml` 的 `environment` 字段里填入上述键值。
+

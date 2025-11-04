@@ -27,10 +27,10 @@ START_SCRIPT = PROJECT_ROOT / "Start.py"
 PID_FILE = PROJECT_ROOT / "start.pid"
 LOG_FILE = PROJECT_ROOT / "realtime.log"
 
-# 在此修改 CookieCloud 配置
-COOKIE_CLOUD_HOST = "http://192.168.5.66:8088"
-COOKIE_CLOUD_UUID = "4RoWtrya9V9VKKP2XNCBZb"
-COOKIE_CLOUD_PASSWORD = "6KUBUjGjtEDmikzFrYQVFc"
+# 优先从环境变量读取 CookieCloud 配置（部署脚本会提前导入 .env）
+COOKIE_CLOUD_HOST = os.getenv("COOKIE_CLOUD_HOST", "").strip()
+COOKIE_CLOUD_UUID = os.getenv("COOKIE_CLOUD_UUID", "").strip()
+COOKIE_CLOUD_PASSWORD = os.getenv("COOKIE_CLOUD_PASSWORD", "").strip()
 
 
 def read_pid() -> int | None:
@@ -63,11 +63,15 @@ def start() -> None:
         sys.exit(f"未找到虚拟环境 Python: {VENV_PYTHON}")
 
     env = os.environ.copy()
-    env.update({
+
+    cookiecloud_env = {
         "COOKIE_CLOUD_HOST": COOKIE_CLOUD_HOST,
         "COOKIE_CLOUD_UUID": COOKIE_CLOUD_UUID,
         "COOKIE_CLOUD_PASSWORD": COOKIE_CLOUD_PASSWORD,
-    })
+    }
+
+    # 仅在值非空时覆盖，便于通过 shell 手动导出环境变量
+    env.update({k: v for k, v in cookiecloud_env.items() if v})
 
     # 确保日志文件存在
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
