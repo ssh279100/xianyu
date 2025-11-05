@@ -3,9 +3,10 @@
 
 Usage:
     python sb.py start   # 后台启动服务
-    python sb.py stop    # 停止服务
+    python sb.py stop    # 停止服务并清理所有浏览器进程
     python sb.py status  # 查看状态
     python sb.py log     # 实时查看日志（按 Ctrl+C 退出）
+    python sb.py clean   # 仅清理残留的浏览器进程
 
 环境变量已经在脚本内写死，如需调整，在下方 `COOKIE_CLOUD_*` 常量修改即可。
 """
@@ -90,8 +91,89 @@ def start() -> None:
     print(f"Start.py 已启动，PID={process.pid}，日志写入 {LOG_FILE}")
 
 
+def cleanup_browser_processes() -> None:
+    """清理所有残留的浏览器进程"""
+    try:
+        import psutil
+    except ImportError:
+        # 如果没有psutil，使用系统命令
+        print("🧹 清理残留浏览器进程...")
+
+        # 要查找的进程名称列表
+        browser_processes = [
+            'chromium',
+            'chrome',
+            'chromium-browser',
+            'google-chrome',
+            'google-chrome-stable',
+            'playwright',
+            'node',  # playwright的node进程
+        ]
+
+        killed_count = 0
+        for process_name in browser_processes:
+            try:
+                # 使用pkill命令
+                result = subprocess.run(
+                    ['pkill', '-f', process_name],
+                    capture_output=True,
+                    text=True
+                )
+                if result.returncode == 0:
+                    killed_count += 1
+            except:
+                pass
+
+        if killed_count > 0:
+            print(f"✅ 已清理 {killed_count} 类浏览器相关进程")
+
+        return
+
+    # 如果有psutil，使用更精确的方法
+    print("🧹 清理残留浏览器进程...")
+
+    browser_keywords = [
+        'chromium',
+        'chrome',
+        'playwright',
+    ]
+
+    killed_processes = []
+    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+        try:
+            # 检查进程名和命令行
+            proc_name = proc.info['name'].lower() if proc.info['name'] else ''
+            cmdline = ' '.join(proc.info['cmdline']) if proc.info['cmdline'] else ''
+
+            # 如果进程名或命令行包含关键词
+            for keyword in browser_keywords:
+                if keyword.lower() in proc_name or keyword.lower() in cmdline.lower():
+                    # 跳过sb.py自己
+                    if 'sb.py' not in cmdline:
+                        try:
+                            proc.terminate()
+                            killed_processes.append(f"{proc.info['name']} (PID: {proc.info['pid']})")
+                            time.sleep(0.1)
+                            if proc.is_running():
+                                proc.kill()
+                        except:
+                            pass
+                        break
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            pass
+
+    if killed_processes:
+        print(f"✅ 已清理以下进程:")
+        for p in killed_processes:
+            print(f"   - {p}")
+
+
 def stop() -> None:
     pid = read_pid()
+
+    # 先清理浏览器进程（无论主进程是否存在）
+    cleanup_browser_processes()
+
     if not pid:
         print("未找到 PID 文件，服务可能未运行。")
         return
@@ -115,6 +197,11 @@ def stop() -> None:
         os.killpg(pid, signal.SIGKILL)
 
     PID_FILE.unlink(missing_ok=True)
+
+    # 再次清理可能的残留进程
+    time.sleep(1)
+    cleanup_browser_processes()
+
     print("服务已停止。")
 
 
@@ -147,8 +234,15 @@ def tail_log() -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Start.py 管理脚本")
-    parser.add_argument("command", choices=["start", "stop", "status", "log"], help="操作命令")
+    parser.add_argument("command", choices=["start", "stop", "status", "log", "clean"], help="操作命令")
     return parser.parse_args()
+
+
+def clean() -> None:
+    """仅清理浏览器进程，不停止主服务"""
+    print("🧹 清理浏览器进程...")
+    cleanup_browser_processes()
+    print("✅ 清理完成")
 
 
 def main() -> None:
@@ -162,6 +256,8 @@ def main() -> None:
         status()
     elif args.command == "log":
         tail_log()
+    elif args.command == "clean":
+        clean()
 
 
 if __name__ == "__main__":

@@ -1455,7 +1455,7 @@ class XianyuLive:
                     # user_id=f"{self.cookie_id}_{int(time.time() * 1000)}",  # 使用唯一ID避免冲突
                     user_id=f"{self.cookie_id}",  # 使用唯一ID避免冲突
                     enable_learning=True,  # 启用学习功能
-                    headless=True  # 使用有头模式（可视化浏览器）
+                    headless=True  # 使用无头模式
                 )
 
                 # 在线程池中执行滑块验证
@@ -1995,7 +1995,6 @@ class XianyuLive:
             # 在Docker环境中添加额外参数
             if os.getenv('DOCKER_ENV'):
                 browser_args.extend([
-                    # '--single-process',  # 注释掉，避免多用户并发时的进程冲突和资源泄漏
                     '--disable-background-networking',
                     '--disable-client-side-phishing-detection',
                     '--disable-hang-monitor',
@@ -2004,6 +2003,19 @@ class XianyuLive:
                     '--disable-web-resources',
                     '--metrics-recording-only',
                     '--safebrowsing-disable-auto-update',
+                    '--enable-automation',
+                    '--password-store=basic',
+                    '--use-mock-keychain'
+                ])
+
+            # 添加Docker环境特殊参数
+            if os.path.exists('/.dockerenv'):
+                browser_args.extend([
+                    '--disable-software-rasterizer',
+                    '--disable-features=VizDisplayCompositor',
+                    '--enable-features=NetworkService',
+                    '--force-webrtc-ip-handling-policy=default_public_interface_only',
+                    '--disable-features=WebRtcHideLocalIpsWithMdns',
                     '--enable-automation',
                     '--password-store=basic',
                     '--use-mock-keychain'
@@ -4804,18 +4816,14 @@ class XianyuLive:
                 '--no-pings'
             ]
 
-            # 在Docker环境中添加额外参数
-            if os.getenv('DOCKER_ENV'):
+            # 添加Docker环境特殊参数
+            if os.path.exists('/.dockerenv'):
                 browser_args.extend([
-                    # '--single-process',  # 注释掉，避免多用户并发时的进程冲突和资源泄漏
-                    '--disable-background-networking',
-                    '--disable-client-side-phishing-detection',
-                    '--disable-hang-monitor',
-                    '--disable-popup-blocking',
-                    '--disable-prompt-on-repost',
-                    '--disable-web-resources',
-                    '--metrics-recording-only',
-                    '--safebrowsing-disable-auto-update',
+                    '--disable-software-rasterizer',
+                    '--disable-features=VizDisplayCompositor',
+                    '--enable-features=NetworkService',
+                    '--force-webrtc-ip-handling-policy=default_public_interface_only',
+                    '--disable-features=WebRtcHideLocalIpsWithMdns',
                     '--enable-automation',
                     '--password-store=basic',
                     '--use-mock-keychain'
@@ -5155,18 +5163,14 @@ class XianyuLive:
                 '--no-pings'
             ]
 
-            # 在Docker环境中添加额外参数
-            if os.getenv('DOCKER_ENV'):
+            # 添加Docker环境特殊参数
+            if os.path.exists('/.dockerenv'):
                 browser_args.extend([
-                    # '--single-process',  # 注释掉，避免多用户并发时的进程冲突和资源泄漏
-                    '--disable-background-networking',
-                    '--disable-client-side-phishing-detection',
-                    '--disable-hang-monitor',
-                    '--disable-popup-blocking',
-                    '--disable-prompt-on-repost',
-                    '--disable-web-resources',
-                    '--metrics-recording-only',
-                    '--safebrowsing-disable-auto-update',
+                    '--disable-software-rasterizer',
+                    '--disable-features=VizDisplayCompositor',
+                    '--enable-features=NetworkService',
+                    '--force-webrtc-ip-handling-policy=default_public_interface_only',
+                    '--disable-features=WebRtcHideLocalIpsWithMdns',
                     '--enable-automation',
                     '--password-store=basic',
                     '--use-mock-keychain'
