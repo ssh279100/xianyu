@@ -96,69 +96,76 @@ def cleanup_browser_processes() -> None:
     try:
         import psutil
     except ImportError:
-        # 如果没有psutil，使用系统命令
+        # 如果没有psutil，使用更安全的方法
         print("🧹 清理残留浏览器进程...")
 
-        # 要查找的进程名称列表
-        browser_processes = [
-            'chromium',
-            'chrome',
-            'chromium-browser',
-            'google-chrome',
-            'google-chrome-stable',
-            'playwright',
-            'node',  # playwright的node进程
-        ]
+        # 使用ps和grep查找特定的浏览器进程
+        try:
+            # 查找chromium进程
+            result = subprocess.run(
+                "ps aux | grep -E '(chromium|google-chrome)' | grep -v grep | awk '{print $2}'",
+                shell=True,
+                capture_output=True,
+                text=True
+            )
 
-        killed_count = 0
-        for process_name in browser_processes:
-            try:
-                # 使用pkill命令
-                result = subprocess.run(
-                    ['pkill', '-f', process_name],
-                    capture_output=True,
-                    text=True
-                )
-                if result.returncode == 0:
-                    killed_count += 1
-            except:
-                pass
+            pids = result.stdout.strip().split('\n')
+            killed_count = 0
 
-        if killed_count > 0:
-            print(f"✅ 已清理 {killed_count} 类浏览器相关进程")
+            for pid in pids:
+                if pid and pid.isdigit():
+                    try:
+                        subprocess.run(['kill', '-9', pid], capture_output=True)
+                        killed_count += 1
+                    except:
+                        pass
+
+            if killed_count > 0:
+                print(f"✅ 已清理 {killed_count} 个浏览器进程")
+            else:
+                print("没有发现浏览器进程")
+
+        except Exception as e:
+            print(f"清理进程时出错: {e}")
 
         return
 
     # 如果有psutil，使用更精确的方法
     print("🧹 清理残留浏览器进程...")
 
-    browser_keywords = [
+    # 只匹配真正的浏览器进程名，不匹配命令行参数
+    browser_process_names = [
         'chromium',
+        'chromium-browser',
         'chrome',
-        'playwright',
+        'google-chrome',
+        'google-chrome-stable',
     ]
 
     killed_processes = []
-    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+    for proc in psutil.process_iter(['pid', 'name', 'exe']):
         try:
-            # 检查进程名和命令行
-            proc_name = proc.info['name'].lower() if proc.info['name'] else ''
-            cmdline = ' '.join(proc.info['cmdline']) if proc.info['cmdline'] else ''
+            proc_name = proc.info['name']
+            if not proc_name:
+                continue
 
-            # 如果进程名或命令行包含关键词
-            for keyword in browser_keywords:
-                if keyword.lower() in proc_name or keyword.lower() in cmdline.lower():
-                    # 跳过sb.py自己
-                    if 'sb.py' not in cmdline:
-                        try:
+            # 严格匹配进程名
+            for browser_name in browser_process_names:
+                if proc_name == browser_name or proc_name.startswith(f"{browser_name}-"):
+                    try:
+                        # 获取进程的可执行文件路径
+                        exe_path = proc.info.get('exe', '')
+                        # 确认是浏览器进程（路径包含chrome或chromium）
+                        if 'chrome' in exe_path.lower() or 'chromium' in exe_path.lower():
                             proc.terminate()
-                            killed_processes.append(f"{proc.info['name']} (PID: {proc.info['pid']})")
+                            killed_processes.append(f"{proc_name} (PID: {proc.info['pid']})")
                             time.sleep(0.1)
                             if proc.is_running():
                                 proc.kill()
-                        except:
-                            pass
-                        break
+                            break
+                    except:
+                        pass
+
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             pass
 
@@ -166,6 +173,8 @@ def cleanup_browser_processes() -> None:
         print(f"✅ 已清理以下进程:")
         for p in killed_processes:
             print(f"   - {p}")
+    else:
+        print("没有发现浏览器进程")
 
 
 def stop() -> None:
