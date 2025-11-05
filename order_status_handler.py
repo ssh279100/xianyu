@@ -538,6 +538,12 @@ class OrderStatusHandler:
             logger.info(f"🔍 根据taskName推断订单关闭: {task_name}")
             return 'cancelled'
 
+        # 交易完成/确认收货
+        completed_keywords = ['确认收货', '交易成功', '评价_卖家', '评价_买家', '期待评价']
+        if any(keyword in task_name for keyword in completed_keywords):
+            logger.info(f"🔍 根据taskName推断订单已完成: {task_name}")
+            return 'completed'
+
         # 退款进行中
         refunding_keywords = ['改为仅退款已同意', '发起退款申请', '申请退款', '退款处理中']
         if any(keyword in task_name for keyword in refunding_keywords):
@@ -595,6 +601,11 @@ class OrderStatusHandler:
         # 卖家确认发货
         if any(keyword in normalized for keyword in ['你已发货', '已发货', '等待买家确认收货']):
             return 'shipped'
+
+        # 交易完成后的评价提醒
+        evaluation_keywords = ['快给ta一个评价吧', '快给TA一个评价吧', '快给他一个评价吧', '快给她一个评价吧', '我完成了评价', '期待你的评价', '有新交易评价', '有新的交易评价']
+        if any(keyword in normalized for keyword in evaluation_keywords):
+            return 'completed'
 
         # 交易完成
         if any(keyword in normalized for keyword in ['确认收货', '交易成功']):
@@ -1048,8 +1059,12 @@ class OrderStatusHandler:
             bool: 是否处理了订单状态更新
         """
         try:
-            # 只处理交易关闭的情况
-            if red_reminder != '交易关闭':
+            # 根据红色提醒确定目标状态
+            if red_reminder == '交易关闭':
+                target_status = 'cancelled'
+            elif red_reminder == '交易成功':
+                target_status = 'completed'
+            else:
                 return False
             
             # 提取订单ID，或根据聊天上下文回退匹配
@@ -1071,9 +1086,9 @@ class OrderStatusHandler:
 
                     self._add_to_pending_updates(
                         order_id=temp_order_id,
-                        new_status='cancelled',
+                        new_status=target_status,
                         cookie_id=cookie_id,
-                        context=f"交易关闭 - 用户{user_id} - {msg_time} - 等待订单ID提取"
+                        context=f"{red_reminder} - 用户{user_id} - {msg_time} - 等待订单ID提取"
                     )
 
                     if cookie_id not in self._pending_red_reminder_messages:
@@ -1085,7 +1100,7 @@ class OrderStatusHandler:
                         'user_id': user_id,
                         'cookie_id': cookie_id,
                         'msg_time': msg_time,
-                        'new_status': 'cancelled',
+                        'new_status': target_status,
                         'temp_order_id': temp_order_id,
                         'message_hash': hash(str(sorted(message.items()))) if isinstance(message, dict) else hash(str(message)),
                         'timestamp': time.time()
@@ -1093,18 +1108,19 @@ class OrderStatusHandler:
 
                     return True
             
-            # 更新订单状态为已关闭
+            # 更新订单状态
             success = self.update_order_status(
                 order_id=order_id,
-                new_status='cancelled',
+                new_status=target_status,
                 cookie_id=cookie_id,
-                context=f"交易关闭 - 用户{user_id} - {msg_time}"
+                context=f"{red_reminder} - 用户{user_id} - {msg_time}"
             )
             
             if success:
-                logger.info(f'[{msg_time}] 【{cookie_id}】交易关闭，订单 {order_id} 状态已更新为已关闭')
+                status_text = self.status_mapping.get(target_status, target_status)
+                logger.info(f'[{msg_time}] 【{cookie_id}】{red_reminder}，订单 {order_id} 状态已更新为{status_text}')
             else:
-                logger.error(f'[{msg_time}] 【{cookie_id}】交易关闭，但订单 {order_id} 状态更新失败')
+                logger.error(f'[{msg_time}] 【{cookie_id}】{red_reminder}，但订单 {order_id} 状态更新失败')
             
             return True
             

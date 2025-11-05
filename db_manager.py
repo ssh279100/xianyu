@@ -3183,11 +3183,10 @@ class DBManager:
                 WHERE dr.enabled = 1 AND c.enabled = 1
                 AND (? LIKE '%' || dr.keyword || '%' OR dr.keyword LIKE '%' || ? || '%')
                 ORDER BY
-                    CASE
-                        WHEN ? LIKE '%' || dr.keyword || '%' THEN LENGTH(dr.keyword)
-                        ELSE LENGTH(dr.keyword) / 2
-                    END DESC,
-                    dr.id ASC
+                    CASE WHEN LOWER(?) = LOWER(dr.keyword) THEN 0 ELSE 1 END,
+                    CASE WHEN INSTR(LOWER(?), LOWER(dr.keyword)) = 1 THEN 0 ELSE 1 END,
+                    INSTR(LOWER(?), LOWER(dr.keyword)),
+                    LOWER(dr.keyword)
                 ''', (keyword, keyword, keyword))
 
                 rules = []
@@ -3360,12 +3359,11 @@ class DBManager:
                     AND (? LIKE '%' || dr.keyword || '%' OR dr.keyword LIKE '%' || ? || '%')
                     AND c.is_multi_spec = 1 AND c.spec_name = ? AND c.spec_value = ?
                     ORDER BY
-                        CASE
-                            WHEN ? LIKE '%' || dr.keyword || '%' THEN LENGTH(dr.keyword)
-                            ELSE LENGTH(dr.keyword) / 2
-                        END DESC,
-                        dr.delivery_times ASC
-                    ''', (keyword, keyword, spec_name, spec_value, keyword))
+                        CASE WHEN LOWER(?) = LOWER(dr.keyword) THEN 0 ELSE 1 END,
+                        CASE WHEN INSTR(LOWER(?), LOWER(dr.keyword)) = 1 THEN 0 ELSE 1 END,
+                        INSTR(LOWER(?), LOWER(dr.keyword)),
+                        LOWER(dr.keyword)
+                    ''', (keyword, keyword, spec_name, spec_value, keyword, keyword, keyword))
 
                     rules = []
                     for row in cursor.fetchall():
@@ -3418,12 +3416,13 @@ class DBManager:
                 AND (? LIKE '%' || dr.keyword || '%' OR dr.keyword LIKE '%' || ? || '%')
                 AND (c.is_multi_spec = 0 OR c.is_multi_spec IS NULL)
                 ORDER BY
+                    CASE WHEN dr.keyword = ? THEN 0 ELSE 1 END,
                     CASE
                         WHEN ? LIKE '%' || dr.keyword || '%' THEN LENGTH(dr.keyword)
                         ELSE LENGTH(dr.keyword) / 2
                     END DESC,
                     dr.delivery_times ASC
-                ''', (keyword, keyword, keyword))
+                ''', (keyword, keyword, keyword, keyword))
 
                 rules = []
                 for row in cursor.fetchall():
